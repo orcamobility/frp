@@ -57,8 +57,8 @@ func NewHTTPS2HTTPPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plugi
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
-			r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
-			r.SetXForwarded()
+			// r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
+			// r.SetXForwarded()
 			req := r.Out
 			req.URL.Scheme = "http"
 			req.URL.Host = p.opts.LocalAddr
