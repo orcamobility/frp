@@ -58,8 +58,8 @@ jobs:
           echo "DOCKERFILE_FRPS_PATH=dockerfiles/Dockerfile-for-frps" >> $GITHUB_ENV
           # echo "TAG_FRPC=037465309653.dkr.ecr.us-west-2.amazonaws.com/frpc-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
           # echo "TAG_FRPS=037465309653.dkr.ecr.us-west-2.amazonaws.com/frps-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
-          echo "TAG_FRPC_GPR=ghcr.io/orcamobility/frpc-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
-          echo "TAG_FRPS_GPR=ghcr.io/orcamobility/frps-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
+          echo "TAG_FRPC_GHCR=ghcr.io/orcamobility/frpc-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
+          echo "TAG_FRPS_GHCR=ghcr.io/orcamobility/frps-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
 
       - name: Build and push frpc
         uses: docker/build-push-action@v5
@@ -69,7 +69,6 @@ jobs:
           platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
           push: true
           tags: |
-            ${{ env.TAG_FRPC }}
             ${{ env.TAG_FRPC_GHCR }}
 
       - name: Build and push frps
@@ -80,5 +79,4 @@ jobs:
           platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
           push: true
           tags: |
-            ${{ env.TAG_FRPS }}
             ${{ env.TAG_FRPS_GHCR }}
