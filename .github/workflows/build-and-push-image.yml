@@ -66,22 +66,27 @@ jobs:
           echo "TAG_FRPC_GHCR=ghcr.io/orcamobility/frpc-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
           echo "TAG_FRPS_GHCR=ghcr.io/orcamobility/frps-base:${{ env.TAG_NAME }}" >> $GITHUB_ENV
 
-      - name: Build and push frpc
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./dockerfiles/Dockerfile-for-frpc
-          platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
-          push: true
-          tags: |
-            ${{ env.TAG_FRPC_GHCR }}
+      - name: Log tags
+        run: |
+          echo $TAG_FRPC_GHCR
+          echo $TAG_FRPS_GHCR
 
-      - name: Build and push frps
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./dockerfiles/Dockerfile-for-frps
-          platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
-          push: true
-          tags: |
-            ${{ env.TAG_FRPS_GHCR }}
+      # - name: Build and push frpc
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: .
+      #     file: ./dockerfiles/Dockerfile-for-frpc
+      #     platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
+      #     push: true
+      #     tags: |
+      #       ${{ env.TAG_FRPC_GHCR }}
+      #
+      # - name: Build and push frps
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: .
+      #     file: ./dockerfiles/Dockerfile-for-frps
+      #     platforms: linux/amd64,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
+      #     push: true
+      #     tags: |
+      #       ${{ env.TAG_FRPS_GHCR }}
