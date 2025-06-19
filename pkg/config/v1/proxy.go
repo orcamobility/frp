@@ -326,7 +326,11 @@ func (c *HTTPProxyConfig) UnmarshalFromMsg(m *msg.NewProxy) {
 	c.HostHeaderRewrite = m.HostHeaderRewrite
 	c.HTTPUser = m.HTTPUser
 	c.HTTPPassword = m.HTTPPwd
-	c.RequestHeaders = m.RequestHeaders
+	if m.Headers != nil {
+		c.RequestHeaders.Set = m.Headers
+	} else {
+		c.RequestHeaders = m.RequestHeaders
+	}
 	c.ResponseHeaders = m.ResponseHeaders
 	c.RouteByHTTPUser = m.RouteByHTTPUser
 }
