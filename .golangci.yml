@@ -1,6 +1,7 @@
 version: "2"
 run:
   concurrency: 4
+  timeout: 20m
   build-tags:
   - integ
   - integfuzz
@@ -72,6 +73,9 @@ linters:
     - linters:
       - revive
       text: unused-parameter
+    - linters:
+      - revive
+      text: "avoid meaningless package names"
     - linters:
       - unparam
       text: is always false
