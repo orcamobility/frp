@@ -100,7 +100,7 @@ func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, erro
 		ctl.msgDispatcher = msg.NewDispatcher(sessionCtx.Conn)
 	}
 	ctl.registerMsgHandlers()
-	ctl.msgTransporter = transport.NewMessageTransporter(ctl.msgDispatcher.SendChannel())
+	ctl.msgTransporter = transport.NewMessageTransporter(ctl.msgDispatcher)
 
 	ctl.pm = proxy.NewManager(ctl.ctx, sessionCtx.Common, ctl.msgTransporter, sessionCtx.VnetController)
 	ctl.vm = visitor.NewManager(ctl.ctx, sessionCtx.RunID, sessionCtx.Common,
@@ -276,10 +276,12 @@ func (ctl *Control) heartbeatWorker() {
 }
 
 func (ctl *Control) worker() {
+	xl := ctl.xl
 	go ctl.heartbeatWorker()
 	go ctl.msgDispatcher.Run()
 
 	<-ctl.msgDispatcher.Done()
+	xl.Debugf("control message dispatcher exited")
 	ctl.closeSession()
 
 	ctl.pm.Close()
