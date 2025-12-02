@@ -108,8 +108,11 @@ type DomainConfig struct {
 }
 
 type ProxyBaseConfig struct {
-	Name        string            `json:"name"`
-	Type        string            `json:"type"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	// Enabled controls whether this proxy is enabled. nil or true means enabled, false means disabled.
+	// This allows individual control over each proxy, complementing the global "start" field.
+	Enabled     *bool             `json:"enabled,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Transport   ProxyTransport    `json:"transport,omitempty"`
 	// metadata info for each proxy
@@ -426,6 +429,9 @@ type XTCPProxyConfig struct {
 
 	Secretkey  string   `json:"secretKey,omitempty"`
 	AllowUsers []string `json:"allowUsers,omitempty"`
+
+	// NatTraversal configuration for NAT traversal
+	NatTraversal *NatTraversalConfig `json:"natTraversal,omitempty"`
 }
 
 func (c *XTCPProxyConfig) MarshalToMsg(m *msg.NewProxy) {

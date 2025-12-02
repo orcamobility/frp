@@ -64,6 +64,8 @@ type ServiceOptions struct {
 	ProxyCfgs   []v1.ProxyConfigurer
 	VisitorCfgs []v1.VisitorConfigurer
 
+	UnsafeFeatures v1.UnsafeFeatures
+
 	// ConfigFilePath is the path to the configuration file used to initialize.
 	// If it is empty, it means that the configuration file is not used for initialization.
 	// It may be initialized using command line parameters or called directly.
@@ -88,13 +90,16 @@ type ServiceOptions struct {
 }
 
 // setServiceOptionsDefault sets the default values for ServiceOptions.
-func setServiceOptionsDefault(options *ServiceOptions) {
+func setServiceOptionsDefault(options *ServiceOptions) error {
 	if options.Common != nil {
-		options.Common.Complete()
+		if err := options.Common.Complete(); err != nil {
+			return err
+		}
 	}
 	if options.ConnectorCreator == nil {
 		options.ConnectorCreator = NewConnector
 	}
+	return nil
 }
 
 // Service is the client service that connects to frps and provides proxy services.
@@ -119,6 +124,8 @@ type Service struct {
 	visitorCfgs []v1.VisitorConfigurer
 	clientSpec  *msg.ClientSpec
 
+	unsafeFeatures v1.UnsafeFeatures
+
 	// The configuration file used to initialize this client, or an empty
 	// string if no configuration file was used.
 	configFilePath string
@@ -134,7 +141,9 @@ type Service struct {
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
-	setServiceOptionsDefault(&options)
+	if err := setServiceOptionsDefault(&options); err != nil {
+		return nil, err
+	}
 
 	var webServer *httppkg.Server
 	if options.Common.WebServer.Port > 0 {
@@ -144,12 +153,19 @@ func NewService(options ServiceOptions) (*Service, error) {
 		}
 		webServer = ws
 	}
+
+	authSetter, err := auth.NewAuthSetter(options.Common.Auth)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Service{
 		ctx:              context.Background(),
-		authSetter:       auth.NewAuthSetter(options.Common.Auth),
+		authSetter:       authSetter,
 		webServer:        webServer,
 		common:           options.Common,
 		configFilePath:   options.ConfigFilePath,
+		unsafeFeatures:   options.UnsafeFeatures,
 		proxyCfgs:        options.ProxyCfgs,
 		visitorCfgs:      options.VisitorCfgs,
 		clientSpec:       options.ClientSpec,
@@ -397,6 +413,10 @@ func (svr *Service) stop() {
 	if svr.ctl != nil {
 		svr.ctl.GracefulClose(svr.gracefulShutdownDuration)
 		svr.ctl = nil
+	}
+	if svr.webServer != nil {
+		svr.webServer.Close()
+		svr.webServer = nil
 	}
 }
 
