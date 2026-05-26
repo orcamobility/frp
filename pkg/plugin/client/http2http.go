@@ -25,6 +25,7 @@ import (
 	"github.com/fatedier/golib/pool"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	httppkg "github.com/fatedier/frp/pkg/util/http"
 	"github.com/fatedier/frp/pkg/util/log"
 	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
@@ -64,6 +65,7 @@ func NewHTTP2HTTPPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plugin
 			for _, v := range p.opts.RequestHeaders.Delete {
 				req.Header.Del(v)
 			}
+			httppkg.PreserveWebSocketHeaderCase(req.Header)
 		},
 		BufferPool: pool.NewBuffer(32 * 1024),
 		ErrorLog:   stdlog.New(log.NewWriteLogger(log.WarnLevel, 2), "", 0),
