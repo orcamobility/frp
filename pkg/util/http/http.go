@@ -100,3 +100,29 @@ func BasicAuth(username, passwd string) string {
 	auth := username + ":" + passwd
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
 }
+
+// websocketHeaderCases maps the Go canonical form of RFC 6455 WebSocket
+// headers (as produced by textproto.CanonicalMIMEHeaderKey) back to the
+// mixed-case form spelled in the RFC. Some strict embedded HTTP parsers
+// (notably several IP-camera firmwares) do byte-wise header-name matching
+// and silently ignore upgrade requests when Sec-WebSocket-* arrives as
+// Sec-Websocket-*, causing the upgrade to hang until the proxy times out.
+var websocketHeaderCases = map[string]string{
+	"Sec-Websocket-Key":        "Sec-WebSocket-Key",
+	"Sec-Websocket-Version":    "Sec-WebSocket-Version",
+	"Sec-Websocket-Protocol":   "Sec-WebSocket-Protocol",
+	"Sec-Websocket-Extensions": "Sec-WebSocket-Extensions",
+	"Sec-Websocket-Accept":     "Sec-WebSocket-Accept",
+}
+
+// PreserveWebSocketHeaderCase rewrites any Sec-Websocket-* keys in h to
+// their RFC 6455 mixed-case spelling. Direct map writes skip
+// CanonicalMIMEHeaderKey and are emitted verbatim by http.Header.WriteSubset.
+func PreserveWebSocketHeaderCase(h http.Header) {
+	for canonical, rfc := range websocketHeaderCases {
+		if v, ok := h[canonical]; ok {
+			delete(h, canonical)
+			h[rfc] = v
+		}
+	}
+}

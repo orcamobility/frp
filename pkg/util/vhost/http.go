@@ -98,6 +98,7 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 			} else {
 				req.URL.Host = req.Host
 			}
+			httppkg.PreserveWebSocketHeaderCase(req.Header)
 		},
 		ModifyResponse: func(r *http.Response) error {
 			rc := r.Request.Context().Value(RouteConfigKey).(*RouteConfig)
@@ -110,6 +111,7 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 					r.Header.Del(v)
 				}
 			}
+			httppkg.PreserveWebSocketHeaderCase(r.Header)
 			return nil
 		},
 		// Create a connection to one proxy routed by route policy.

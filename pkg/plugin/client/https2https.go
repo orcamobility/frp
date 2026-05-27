@@ -76,6 +76,7 @@ func NewHTTPS2HTTPSPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plug
 			for _, v := range p.opts.RequestHeaders.Delete {
 				req.Header.Del(v)
 			}
+			httppkg.PreserveWebSocketHeaderCase(req.Header)
 		},
 		Transport:  tr,
 		BufferPool: pool.NewBuffer(32 * 1024),
