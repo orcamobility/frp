@@ -19,9 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
-	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatedier/golib/crypto"
@@ -29,12 +30,15 @@ import (
 
 	"github.com/fatedier/frp/client/proxy"
 	"github.com/fatedier/frp/pkg/auth"
+	"github.com/fatedier/frp/pkg/config"
+	"github.com/fatedier/frp/pkg/config/source"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/msg"
+	"github.com/fatedier/frp/pkg/policy/security"
 	httppkg "github.com/fatedier/frp/pkg/util/http"
 	"github.com/fatedier/frp/pkg/util/log"
 	netpkg "github.com/fatedier/frp/pkg/util/net"
-	"github.com/fatedier/frp/pkg/util/version"
 	"github.com/fatedier/frp/pkg/util/wait"
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/pkg/vnet"
@@ -60,11 +64,13 @@ func (e cancelErr) Error() string {
 
 // ServiceOptions contains options for creating a new client service.
 type ServiceOptions struct {
-	Common      *v1.ClientCommonConfig
-	ProxyCfgs   []v1.ProxyConfigurer
-	VisitorCfgs []v1.VisitorConfigurer
+	Common *v1.ClientCommonConfig
 
-	UnsafeFeatures v1.UnsafeFeatures
+	// ConfigSourceAggregator manages internal config and optional store sources.
+	// It is required for creating a Service.
+	ConfigSourceAggregator *source.Aggregator
+
+	UnsafeFeatures *security.UnsafeFeatures
 
 	// ConfigFilePath is the path to the configuration file used to initialize.
 	// If it is empty, it means that the configuration file is not used for initialization.
@@ -105,26 +111,41 @@ func setServiceOptionsDefault(options *ServiceOptions) error {
 // Service is the client service that connects to frps and provides proxy services.
 type Service struct {
 	ctlMu sync.RWMutex
+	// Stores gracefulShutdownDuration independently from ctlMu, because the
+	// graceful shutdown wait may hold ctlMu for an arbitrary duration.
+	gracefulShutdownDuration atomic.Int64
 	// manager control connection with server
 	ctl *Control
 	// Uniq id got from frps, it will be attached to loginMsg.
 	runID string
 
-	// Sets authentication based on selected method
-	authSetter auth.Setter
+	// Auth runtime and encryption materials
+	auth *auth.ClientAuth
 
 	// web server for admin UI and apis
 	webServer *httppkg.Server
 
 	vnetController *vnet.Controller
 
-	cfgMu       sync.RWMutex
-	common      *v1.ClientCommonConfig
-	proxyCfgs   []v1.ProxyConfigurer
-	visitorCfgs []v1.VisitorConfigurer
-	clientSpec  *msg.ClientSpec
+	cfgMu sync.RWMutex
+	// reloadMu serializes reload transactions to keep reloadCommon and applied
+	// config in sync across concurrent API operations.
+	reloadMu sync.Mutex
+	common   *v1.ClientCommonConfig
+	// reloadCommon is used for filtering/defaulting during config-source reloads.
+	// It can be updated by /api/reload without mutating startup-only common behavior.
+	reloadCommon *v1.ClientCommonConfig
+	proxyCfgs    []v1.ProxyConfigurer
+	visitorCfgs  []v1.VisitorConfigurer
+	clientSpec   *msg.ClientSpec
 
-	unsafeFeatures v1.UnsafeFeatures
+	// aggregator manages multiple configuration sources.
+	// When set, the service watches for config changes and reloads automatically.
+	aggregator   *source.Aggregator
+	configSource *source.ConfigSource
+	storeSource  *source.StoreSource
+
+	unsafeFeatures *security.UnsafeFeatures
 
 	// The configuration file used to initialize this client, or an empty
 	// string if no configuration file was used.
@@ -133,8 +154,10 @@ type Service struct {
 	// service context
 	ctx context.Context
 	// call cancel to stop service
-	cancel                   context.CancelCauseFunc
-	gracefulShutdownDuration time.Duration
+	cancel context.CancelCauseFunc
+	// Protect cancel publication and shutdown before the first Run.
+	lifecycleMu sync.Mutex
+	closed      bool
 
 	connectorCreator func(context.Context, *v1.ClientCommonConfig) Connector
 	handleWorkConnCb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
@@ -145,6 +168,28 @@ func NewService(options ServiceOptions) (*Service, error) {
 		return nil, err
 	}
 
+	authRuntime, err := auth.BuildClientAuth(&options.Common.Auth)
+	if err != nil {
+		return nil, err
+	}
+
+	if options.ConfigSourceAggregator == nil {
+		return nil, fmt.Errorf("config source aggregator is required")
+	}
+
+	configSource := options.ConfigSourceAggregator.ConfigSource()
+	storeSource := options.ConfigSourceAggregator.StoreSource()
+
+	proxyCfgs, visitorCfgs, loadErr := options.ConfigSourceAggregator.Load()
+	if loadErr != nil {
+		return nil, fmt.Errorf("failed to load config from aggregator: %w", loadErr)
+	}
+	proxyCfgs, visitorCfgs = config.FilterClientConfigurers(options.Common, proxyCfgs, visitorCfgs)
+	proxyCfgs = config.CompleteProxyConfigurers(proxyCfgs)
+	visitorCfgs = config.CompleteVisitorConfigurers(visitorCfgs)
+
+	// Create the web server after all fallible steps so its listener is not
+	// leaked when an earlier error causes NewService to return.
 	var webServer *httppkg.Server
 	if options.Common.WebServer.Port > 0 {
 		ws, err := httppkg.NewServer(options.Common.WebServer)
@@ -154,24 +199,24 @@ func NewService(options ServiceOptions) (*Service, error) {
 		webServer = ws
 	}
 
-	authSetter, err := auth.NewAuthSetter(options.Common.Auth)
-	if err != nil {
-		return nil, err
-	}
-
 	s := &Service{
 		ctx:              context.Background(),
-		authSetter:       authSetter,
+		auth:             authRuntime,
 		webServer:        webServer,
 		common:           options.Common,
+		reloadCommon:     options.Common,
 		configFilePath:   options.ConfigFilePath,
 		unsafeFeatures:   options.UnsafeFeatures,
-		proxyCfgs:        options.ProxyCfgs,
-		visitorCfgs:      options.VisitorCfgs,
+		proxyCfgs:        proxyCfgs,
+		visitorCfgs:      visitorCfgs,
 		clientSpec:       options.ClientSpec,
+		aggregator:       options.ConfigSourceAggregator,
+		configSource:     configSource,
+		storeSource:      storeSource,
 		connectorCreator: options.ConnectorCreator,
 		handleWorkConnCb: options.HandleWorkConnCb,
 	}
+
 	if webServer != nil {
 		webServer.RouteRegister(s.registerRouteHandlers)
 	}
@@ -183,8 +228,20 @@ func NewService(options ServiceOptions) (*Service, error) {
 
 func (svr *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancelCause(ctx)
+	svr.lifecycleMu.Lock()
+	if svr.closed {
+		svr.lifecycleMu.Unlock()
+		cancel(nil)
+		return ctx.Err()
+	}
 	svr.ctx = xlog.NewContext(ctx, xlog.FromContextSafe(ctx))
 	svr.cancel = cancel
+	svr.lifecycleMu.Unlock()
+	defer cancel(nil)
+	defer svr.stop()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// set custom DNSServer
 	if svr.common.DNSServer != "" {
@@ -192,22 +249,24 @@ func (svr *Service) Run(ctx context.Context) error {
 	}
 
 	if svr.vnetController != nil {
+		vnetController := svr.vnetController
 		if err := svr.vnetController.Init(); err != nil {
 			log.Errorf("init virtual network controller error: %v", err)
 			return err
 		}
 		go func() {
 			log.Infof("virtual network controller start...")
-			if err := svr.vnetController.Run(); err != nil {
+			if err := vnetController.Run(); err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Warnf("virtual network controller exit with error: %v", err)
 			}
 		}()
 	}
 
 	if svr.webServer != nil {
+		webServer := svr.webServer
 		go func() {
-			log.Infof("admin server listen on %s", svr.webServer.Address())
-			if err := svr.webServer.Run(); err != nil {
+			log.Infof("admin server listen on %s", webServer.Address())
+			if err := webServer.Run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Warnf("admin server exit with error: %v", err)
 			}
 		}()
@@ -224,12 +283,19 @@ func (svr *Service) Run(ctx context.Context) error {
 	go svr.keepControllerWorking()
 
 	<-svr.ctx.Done()
-	svr.stop()
 	return nil
 }
 
 func (svr *Service) keepControllerWorking() {
-	<-svr.ctl.Done()
+	// ctl is swapped under ctlMu in loopLoginUntilSuccess / stop; take a
+	// snapshot before waiting so stop's nil write does not race this read.
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl == nil {
+		return
+	}
+	<-ctl.Done()
 
 	// There is a situation where the login is successful but due to certain reasons,
 	// the control immediately exits. It is necessary to limit the frequency of reconnection in this case.
@@ -239,8 +305,11 @@ func (svr *Service) keepControllerWorking() {
 		// loopLoginUntilSuccess is another layer of loop that will continuously attempt to
 		// login to the server until successful.
 		svr.loopLoginUntilSuccess(20*time.Second, false)
-		if svr.ctl != nil {
-			<-svr.ctl.Done()
+		svr.ctlMu.RLock()
+		ctl := svr.ctl
+		svr.ctlMu.RUnlock()
+		if ctl != nil {
+			<-ctl.Done()
 			return false, errors.New("control is closed and try another loop")
 		}
 		// If the control is nil, it means that the login failed and the service is also closed.
@@ -259,76 +328,20 @@ func (svr *Service) keepControllerWorking() {
 	), true, svr.ctx.Done())
 }
 
-// login creates a connection to frps and registers it self as a client
-// conn: control connection
-// session: if it's not nil, using tcp mux
-func (svr *Service) login() (conn net.Conn, connector Connector, err error) {
-	xl := xlog.FromContextSafe(svr.ctx)
-	connector = svr.connectorCreator(svr.ctx, svr.common)
-	if err = connector.Open(); err != nil {
-		return nil, nil, err
-	}
-
-	defer func() {
-		if err != nil {
-			connector.Close()
-		}
-	}()
-
-	conn, err = connector.Connect()
-	if err != nil {
-		return
-	}
-
-	loginMsg := &msg.Login{
-		Arch:      runtime.GOARCH,
-		Os:        runtime.GOOS,
-		PoolCount: svr.common.Transport.PoolCount,
-		User:      svr.common.User,
-		Version:   version.Full(),
-		Timestamp: time.Now().Unix(),
-		RunID:     svr.runID,
-		Metas:     svr.common.Metadatas,
-	}
-	if svr.clientSpec != nil {
-		loginMsg.ClientSpec = *svr.clientSpec
-	}
-
-	// Add auth
-	if err = svr.authSetter.SetLogin(loginMsg); err != nil {
-		return
-	}
-
-	if err = msg.WriteMsg(conn, loginMsg); err != nil {
-		return
-	}
-
-	var loginRespMsg msg.LoginResp
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if err = msg.ReadMsgInto(conn, &loginRespMsg); err != nil {
-		return
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-
-	if loginRespMsg.Error != "" {
-		err = fmt.Errorf("%s", loginRespMsg.Error)
-		xl.Errorf("%s", loginRespMsg.Error)
-		return
-	}
-
-	svr.runID = loginRespMsg.RunID
-	xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
-
-	xl.Infof("login to server success, get run id [%s]", loginRespMsg.RunID)
-	return
-}
-
 func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginExit bool) {
 	xl := xlog.FromContextSafe(svr.ctx)
 
 	loginFunc := func() (bool, error) {
 		xl.Infof("try to connect to server...")
-		conn, connector, err := svr.login()
+		dialer := &controlSessionDialer{
+			ctx:              svr.ctx,
+			common:           svr.common,
+			auth:             svr.auth,
+			clientSpec:       svr.clientSpec,
+			vnetController:   svr.vnetController,
+			connectorCreator: svr.connectorCreator,
+		}
+		sessionCtx, err := dialer.Dial(svr.runID)
 		if err != nil {
 			xl.Warnf("connect to server error: %v", err)
 			if firstLoginExit {
@@ -337,25 +350,19 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			return false, err
 		}
 
+		svr.runID = sessionCtx.RunID
+		xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
+		xl.Infof("login to server success, get run id [%s]", svr.runID)
+
 		svr.cfgMu.RLock()
 		proxyCfgs := svr.proxyCfgs
 		visitorCfgs := svr.visitorCfgs
 		svr.cfgMu.RUnlock()
 
-		connEncrypted := svr.clientSpec == nil || svr.clientSpec.Type != "ssh-tunnel"
-
-		sessionCtx := &SessionContext{
-			Common:         svr.common,
-			RunID:          svr.runID,
-			Conn:           conn,
-			ConnEncrypted:  connEncrypted,
-			AuthSetter:     svr.authSetter,
-			Connector:      connector,
-			VnetController: svr.vnetController,
-		}
 		ctl, err := NewControl(svr.ctx, sessionCtx)
 		if err != nil {
-			conn.Close()
+			sessionCtx.Conn.Close()
+			sessionCtx.Connector.Close()
 			xl.Errorf("new control error: %v", err)
 			return false, err
 		}
@@ -393,7 +400,36 @@ func (svr *Service) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorC
 	svr.ctlMu.RUnlock()
 
 	if ctl != nil {
-		return svr.ctl.UpdateAllConfigurer(proxyCfgs, visitorCfgs)
+		return ctl.UpdateAllConfigurer(proxyCfgs, visitorCfgs)
+	}
+	return nil
+}
+
+func (svr *Service) UpdateConfigSource(
+	common *v1.ClientCommonConfig,
+	proxyCfgs []v1.ProxyConfigurer,
+	visitorCfgs []v1.VisitorConfigurer,
+) error {
+	svr.reloadMu.Lock()
+	defer svr.reloadMu.Unlock()
+
+	cfgSource := svr.configSource
+	if cfgSource == nil {
+		return fmt.Errorf("config source is not available")
+	}
+
+	if err := cfgSource.ReplaceAll(proxyCfgs, visitorCfgs); err != nil {
+		return err
+	}
+
+	// Non-atomic update semantics: source has been updated at this point.
+	// Even if reload fails below, keep this common config for subsequent reloads.
+	svr.cfgMu.Lock()
+	svr.reloadCommon = common
+	svr.cfgMu.Unlock()
+
+	if err := svr.reloadConfigFromSourcesLocked(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -403,20 +439,47 @@ func (svr *Service) Close() {
 }
 
 func (svr *Service) GracefulClose(d time.Duration) {
-	svr.gracefulShutdownDuration = d
-	svr.cancel(nil)
+	svr.gracefulShutdownDuration.Store(int64(d))
+	svr.lifecycleMu.Lock()
+	if svr.closed {
+		svr.lifecycleMu.Unlock()
+		return
+	}
+	svr.closed = true
+	cancel := svr.cancel
+	svr.lifecycleMu.Unlock()
+	if cancel != nil {
+		// Once Run has claimed startup, it also owns cleanup.
+		cancel(nil)
+	} else {
+		svr.stop()
+	}
 }
 
 func (svr *Service) stop() {
+	// Coordinate shutdown with reload/update paths that read source pointers.
+	svr.reloadMu.Lock()
+	if svr.aggregator != nil {
+		svr.aggregator = nil
+	}
+	svr.configSource = nil
+	svr.storeSource = nil
+	svr.reloadMu.Unlock()
+
 	svr.ctlMu.Lock()
 	defer svr.ctlMu.Unlock()
 	if svr.ctl != nil {
-		svr.ctl.GracefulClose(svr.gracefulShutdownDuration)
+		d := time.Duration(svr.gracefulShutdownDuration.Load())
+		svr.ctl.GracefulClose(d)
 		svr.ctl = nil
 	}
 	if svr.webServer != nil {
 		svr.webServer.Close()
 		svr.webServer = nil
+	}
+	if svr.vnetController != nil {
+		_ = svr.vnetController.Stop()
+		svr.vnetController = nil
 	}
 }
 
@@ -429,6 +492,17 @@ func (svr *Service) getProxyStatus(name string) (*proxy.WorkingStatus, bool) {
 		return nil, false
 	}
 	return ctl.pm.GetProxyStatus(name)
+}
+
+func (svr *Service) getVisitorCfg(name string) (v1.VisitorConfigurer, bool) {
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+
+	if ctl == nil {
+		return nil, false
+	}
+	return ctl.vm.GetVisitorCfg(name)
 }
 
 func (svr *Service) StatusExporter() StatusExporter {
@@ -447,4 +521,43 @@ type statusExporterImpl struct {
 
 func (s *statusExporterImpl) GetProxyStatus(name string) (*proxy.WorkingStatus, bool) {
 	return s.getProxyStatusFunc(name)
+}
+
+func (svr *Service) reloadConfigFromSources() error {
+	svr.reloadMu.Lock()
+	defer svr.reloadMu.Unlock()
+	return svr.reloadConfigFromSourcesLocked()
+}
+
+func (svr *Service) reloadConfigFromSourcesLocked() error {
+	aggregator := svr.aggregator
+	if aggregator == nil {
+		return errors.New("config aggregator is not initialized")
+	}
+
+	svr.cfgMu.RLock()
+	reloadCommon := svr.reloadCommon
+	svr.cfgMu.RUnlock()
+
+	proxies, visitors, err := aggregator.Load()
+	if err != nil {
+		return fmt.Errorf("reload config from sources failed: %w", err)
+	}
+
+	proxies, visitors = config.FilterClientConfigurers(reloadCommon, proxies, visitors)
+	proxies = config.CompleteProxyConfigurers(proxies)
+	visitors = config.CompleteVisitorConfigurers(visitors)
+	requirements := validation.GetClientConfigRequirements(reloadCommon, proxies, visitors)
+	if svr.vnetController == nil && requirements.VirtualNet {
+		return errors.New(
+			"VirtualNet-dependent configuration requires a VirtualNet runtime enabled at startup; " +
+				"restart frpc after configuring featureGates.VirtualNet and virtualNet.address",
+		)
+	}
+
+	// Atomically replace the entire configuration
+	if err := svr.UpdateAllConfigurer(proxies, visitors); err != nil {
+		return err
+	}
+	return nil
 }

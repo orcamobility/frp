@@ -1,12 +1,13 @@
-## Features
-
-* HTTPS proxies now support load balancing groups. Multiple HTTPS proxies can be configured with the same `loadBalancer.group` and `loadBalancer.groupKey` to share the same custom domain and distribute traffic across multiple backend services, similar to the existing TCP and HTTP load balancing capabilities.
-* Individual frpc proxies and visitors now accept an `enabled` flag (defaults to true), letting you disable specific entries without relying on the global `start` list—disabled blocks are skipped when client configs load.
-
 ## Improvements
 
-* **VirtualNet**: Implemented intelligent reconnection with exponential backoff. When connection errors occur repeatedly, the reconnect interval increases from 60s to 300s (max), reducing unnecessary reconnection attempts. Normal disconnections still reconnect quickly at 10s intervals.
+* Building frp from source now requires Go 1.26.0 or later.
 
 ## Fixes
 
-* Fix deadlock issue when TCP connection is closed. Previously, sending messages could block forever if the connection handler had already stopped.
+* Updated dependencies to fix SSH tunnel gateway channel deadlocks and panics caused by malformed challenges from NTLM-authenticated HTTP proxies.
+* Fixed VirtualNet routing issues during reconnection and shutdown, and excessive retries after repeated connection failures.
+* Health checks now reset the failure count after success, so `healthCheck.maxFailed` applies to consecutive failures.
+* Fixed control connections getting stuck after message write failures, which could block reconnection.
+* Fixed incorrect daily traffic statistics around daylight-saving transitions and skipped local midnights.
+* Fixed early-data loss in HTTP virtual-host CONNECT tunnels. Requests with a positive content length or transfer encoding now return HTTP 400.
+* Fixed work connections remaining open when server-side bandwidth limiting is enabled for TCP, HTTP, and UDP proxies.

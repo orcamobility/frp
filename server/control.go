@@ -17,6 +17,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -32,80 +33,361 @@ import (
 	"github.com/fatedier/frp/pkg/msg"
 	plugin "github.com/fatedier/frp/pkg/plugin/server"
 	"github.com/fatedier/frp/pkg/transport"
-	netpkg "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/util"
-	"github.com/fatedier/frp/pkg/util/version"
 	"github.com/fatedier/frp/pkg/util/wait"
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/server/controller"
 	"github.com/fatedier/frp/server/metrics"
 	"github.com/fatedier/frp/server/proxy"
+	"github.com/fatedier/frp/server/registry"
 )
+
+type ControlID uint64
+
+var nextControlID atomic.Uint64
+
+const workConnPoolCapacityOffset = 10
+
+type controlEntry struct {
+	ctl *Control
+	id  ControlID
+	// runMu serializes lifecycle and routing decisions for one run ID.
+	// Replacements inherit it; removing the entry releases the manager's reference.
+	runMu *sync.Mutex
+
+	registryOnline    bool
+	registryControlID ControlID
+}
 
 type ControlManager struct {
 	// controls indexed by run id
-	ctlsByRunID map[string]*Control
+	ctlsByRunID map[string]*controlEntry
+	registry    *registry.ClientRegistry
+	closed      bool
 
 	mu sync.RWMutex
 }
 
-func NewControlManager() *ControlManager {
+func NewControlManager(clientRegistry *registry.ClientRegistry) *ControlManager {
 	return &ControlManager{
-		ctlsByRunID: make(map[string]*Control),
+		ctlsByRunID: make(map[string]*controlEntry),
+		registry:    clientRegistry,
 	}
 }
 
-func (cm *ControlManager) Add(runID string, ctl *Control) (old *Control) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	var ok bool
-	old, ok = cm.ctlsByRunID[runID]
-	if ok {
-		old.Replaced(ctl)
+// lockCurrentRun returns the current entry with its run gate held. It never
+// waits for the gate while holding cm.mu and revalidates the gate after waiting.
+// The global order is runMu, cm.mu, ctl.lifecycleMu, then registry locks.
+func (cm *ControlManager) lockCurrentRun(runID string, allowClosed bool) (*controlEntry, bool) {
+	cm.mu.RLock()
+	entry, ok := cm.ctlsByRunID[runID]
+	if cm.closed && !allowClosed {
+		ok = false
 	}
-	cm.ctlsByRunID[runID] = ctl
-	return
+	cm.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+
+	runMu := entry.runMu
+	runMu.Lock()
+	cm.mu.RLock()
+	entry, ok = cm.ctlsByRunID[runID]
+	if (cm.closed && !allowClosed) || !ok || entry.runMu != runMu {
+		ok = false
+	}
+	cm.mu.RUnlock()
+	if !ok {
+		runMu.Unlock()
+		return nil, false
+	}
+	return entry, true
 }
 
-// we should make sure if it's the same control to prevent delete a new one
-func (cm *ControlManager) Del(runID string, ctl *Control) {
+// Add makes ctl the pending current generation and records the predecessor
+// finalization barrier it must wait for before activation.
+func (cm *ControlManager) Add(ctl *Control) error {
+	for {
+		// Never wait for a run gate while holding cm.mu.
+		cm.mu.RLock()
+		old := cm.ctlsByRunID[ctl.runID]
+		cm.mu.RUnlock()
+		if old != nil {
+			old.runMu.Lock()
+		}
+
+		cm.mu.Lock()
+		if cm.closed {
+			cm.mu.Unlock()
+			if old != nil {
+				old.runMu.Unlock()
+			}
+			return fmt.Errorf("control manager is closed")
+		}
+		if cm.ctlsByRunID[ctl.runID] != old {
+			cm.mu.Unlock()
+			if old != nil {
+				old.runMu.Unlock()
+			}
+			continue
+		}
+
+		id := ControlID(nextControlID.Add(1))
+		if err := ctl.admit(cm, id); err != nil {
+			cm.mu.Unlock()
+			if old != nil {
+				old.runMu.Unlock()
+			}
+			return err
+		}
+
+		runMu := &sync.Mutex{}
+		if old != nil {
+			runMu = old.runMu
+		}
+		entry := &controlEntry{ctl: ctl, id: id, runMu: runMu}
+		var (
+			oldCtl  *Control
+			barrier <-chan struct{}
+		)
+		if old != nil {
+			oldCtl = old.ctl
+			barrier = oldCtl.markReplaced()
+			ctl.setHandoffBarrier(barrier)
+			entry.registryOnline = old.registryOnline
+			entry.registryControlID = old.registryControlID
+		}
+		cm.ctlsByRunID[ctl.runID] = entry
+		cm.mu.Unlock()
+		if old != nil {
+			old.runMu.Unlock()
+		}
+
+		if oldCtl != nil {
+			oldCtl.Replaced(ctl)
+		}
+		return nil
+	}
+}
+
+// Activate registers ctl as online only if it is still the pending current
+// generation.
+func (cm *ControlManager) Activate(ctl *Control) (bool, error) {
+	entry, ok := cm.lockCurrentRun(ctl.runID, false)
+	if !ok {
+		return false, nil
+	}
+	defer entry.runMu.Unlock()
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if c, ok := cm.ctlsByRunID[runID]; ok && c == ctl {
-		delete(cm.ctlsByRunID, runID)
+
+	if cm.closed || cm.ctlsByRunID[ctl.runID] != entry || entry.ctl != ctl || entry.id != ctl.controlID {
+		return false, nil
 	}
+
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	if ctl.state != controlStatePending {
+		return false, nil
+	}
+	if ctl.activated {
+		return true, nil
+	}
+
+	loginMsg := ctl.sessionCtx.LoginMsg
+	remoteAddr := ctl.sessionCtx.Conn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		remoteAddr = host
+	}
+	_, conflict := cm.registry.RegisterWithControlID(
+		loginMsg.User,
+		loginMsg.ClientID,
+		ctl.runID,
+		loginMsg.Hostname,
+		loginMsg.Version,
+		remoteAddr,
+		ctl.sessionCtx.WireProtocol,
+		uint64(entry.id),
+	)
+	if conflict {
+		return true, fmt.Errorf("client_id [%s] for user [%s] is already online", loginMsg.ClientID, loginMsg.User)
+	}
+
+	entry.registryOnline = true
+	entry.registryControlID = entry.id
+	ctl.activated = true
+	return true, nil
+}
+
+// completeLogin reserves ctl's current ownership with its run gate while the
+// bounded successful LoginResp write runs, then transitions it to running.
+// The callback must only perform that bounded write; it must not call back into
+// the control manager or the same control lifecycle.
+func (cm *ControlManager) completeLogin(ctl *Control, writeSuccess func() error) (bool, error) {
+	entry, ok := cm.lockCurrentRun(ctl.runID, false)
+	if !ok {
+		return false, nil
+	}
+	defer entry.runMu.Unlock()
+	if entry.ctl != ctl || entry.id != ctl.controlID {
+		return false, nil
+	}
+
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	if ctl.state != controlStatePending || !ctl.activated {
+		return false, nil
+	}
+	if err := writeSuccess(); err != nil {
+		return false, err
+	}
+	if !ctl.startLocked() {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Remove deletes and offlines ctl only if it is still the current generation.
+func (cm *ControlManager) Remove(ctl *Control) bool {
+	entry, ok := cm.lockCurrentRun(ctl.runID, true)
+	if !ok {
+		return false
+	}
+	defer entry.runMu.Unlock()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.ctlsByRunID[ctl.runID] != entry || entry.ctl != ctl || entry.id != ctl.controlID {
+		return false
+	}
+	delete(cm.ctlsByRunID, ctl.runID)
+	if entry.registryOnline {
+		cm.registry.MarkOfflineByRunIDAndControlID(ctl.runID, uint64(entry.registryControlID))
+	}
+	return true
 }
 
 func (cm *ControlManager) GetByID(runID string) (ctl *Control, ok bool) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	ctl, ok = cm.ctlsByRunID[runID]
-	return
+	entry, ok := cm.lockCurrentRun(runID, false)
+	if !ok {
+		return nil, false
+	}
+	defer entry.runMu.Unlock()
+	ctl = entry.ctl
+
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	if ctl.state != controlStateRunning {
+		return nil, false
+	}
+	return ctl, true
+}
+
+// admitVisitorByRunID commits a visitor admission against the current running
+// control while its run and lifecycle ownership are held. The callback must
+// only perform the in-memory, buffered visitor admission.
+func (cm *ControlManager) admitVisitorByRunID(runID string, admit func(user, wireProtocol, udpPacketCodec string) error) (bool, error) {
+	entry, ok := cm.lockCurrentRun(runID, false)
+	if !ok {
+		return false, nil
+	}
+	defer entry.runMu.Unlock()
+	ctl := entry.ctl
+
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	if ctl.state != controlStateRunning {
+		return false, nil
+	}
+	return true, admit(ctl.sessionCtx.LoginMsg.User, ctl.sessionCtx.WireProtocol, ctl.sessionCtx.UDPPacketCodec)
+}
+
+// RegisterWorkConn transfers conn to ctl only if ctl is still the current
+// running generation. On error, ownership remains with the caller.
+func (cm *ControlManager) RegisterWorkConn(ctl *Control, conn *proxy.WorkConn) error {
+	entry, ok := cm.lockCurrentRun(ctl.runID, false)
+	if !ok {
+		cm.mu.RLock()
+		closed := cm.closed
+		cm.mu.RUnlock()
+		if closed {
+			return fmt.Errorf("control manager is closed")
+		}
+		return fmt.Errorf("client control for run id [%s] is no longer current", ctl.runID)
+	}
+	defer entry.runMu.Unlock()
+	if entry.ctl != ctl || entry.id != ctl.controlID {
+		return fmt.Errorf("client control for run id [%s] is no longer current", ctl.runID)
+	}
+
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	if ctl.state != controlStateRunning {
+		return fmt.Errorf("client control for run id [%s] is not running", ctl.runID)
+	}
+
+	select {
+	case ctl.workConnCh <- conn:
+		ctl.xl.Debugf("new work connection registered")
+		return nil
+	default:
+		ctl.xl.Debugf("work connection pool is full, discarding")
+		return fmt.Errorf("work connection pool is full, discarding")
+	}
 }
 
 func (cm *ControlManager) Close() error {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	for _, ctl := range cm.ctlsByRunID {
-		ctl.Close()
+	cm.closed = true
+	ctls := make([]*Control, 0, len(cm.ctlsByRunID))
+	for _, entry := range cm.ctlsByRunID {
+		ctls = append(ctls, entry.ctl)
 	}
-	cm.ctlsByRunID = make(map[string]*Control)
+	cm.mu.Unlock()
+
+	for _, ctl := range ctls {
+		cm.Remove(ctl)
+		_ = ctl.Close()
+	}
 	return nil
 }
 
-type Control struct {
+// SessionContext encapsulates the input parameters for creating a new Control.
+type SessionContext struct {
 	// all resource managers and controllers
-	rc *controller.ResourceController
-
+	RC *controller.ResourceController
 	// proxy manager
-	pxyManager *proxy.Manager
-
+	PxyManager *proxy.Manager
 	// plugin manager
-	pluginManager *plugin.Manager
-
+	PluginManager *plugin.Manager
 	// verifies authentication based on selected method
-	authVerifier auth.Verifier
+	AuthVerifier auth.Verifier
+	// key used for connection encryption
+	EncryptionKey []byte
+	// control connection
+	Conn *msg.Conn
+	// login message
+	LoginMsg *msg.Login
+	// server configuration
+	ServerCfg *v1.ServerConfig
+	// negotiated wire protocol for this client session
+	WireProtocol   string
+	UDPPacketCodec string
+}
+
+type controlState uint8
+
+const (
+	controlStateCreated controlState = iota
+	controlStatePending
+	controlStateRunning
+	controlStateClosing
+	controlStateClosed
+)
+
+type Control struct {
+	// session context
+	sessionCtx *SessionContext
 
 	// other components can use this to communicate with client
 	msgTransporter transport.MessageTransporter
@@ -114,14 +396,8 @@ type Control struct {
 	// It provides a channel for sending messages, and you can register handlers to process messages based on their respective types.
 	msgDispatcher *msg.Dispatcher
 
-	// login message
-	loginMsg *msg.Login
-
-	// control connection
-	conn net.Conn
-
 	// work connections
-	workConnCh chan net.Conn
+	workConnCh chan *proxy.WorkConn
 
 	// proxies in one client
 	proxies map[string]proxy.Proxy
@@ -135,124 +411,188 @@ type Control struct {
 	// last time got the Ping message
 	lastPing atomic.Value
 
-	// A new run id will be generated when a new client login.
-	// If run id got from login message has same run id, it means it's the same client, so we can
-	// replace old controller instantly.
-	runID string
+	// runID never changes during the lifetime of a control. controlID is assigned
+	// once by ControlManager and distinguishes same-runID generations.
+	runID     string
+	controlID ControlID
+	manager   *ControlManager
+
+	lifecycleMu    sync.Mutex
+	state          controlState
+	activated      bool
+	handoffBarrier <-chan struct{}
+
+	interruptOnce sync.Once
+	interruptErr  error
 
 	mu sync.RWMutex
 
-	// Server configuration information
-	serverCfg *v1.ServerConfig
-
-	xl     *xlog.Logger
-	ctx    context.Context
-	doneCh chan struct{}
+	xl            *xlog.Logger
+	ctx           context.Context
+	doneCh        chan struct{}
+	serverMetrics metrics.ServerMetrics
 }
 
-// TODO(fatedier): Referencing the implementation of frpc, encapsulate the input parameters as SessionContext.
-func NewControl(
-	ctx context.Context,
-	rc *controller.ResourceController,
-	pxyManager *proxy.Manager,
-	pluginManager *plugin.Manager,
-	authVerifier auth.Verifier,
-	ctlConn net.Conn,
-	ctlConnEncrypted bool,
-	loginMsg *msg.Login,
-	serverCfg *v1.ServerConfig,
-) (*Control, error) {
-	poolCount := loginMsg.PoolCount
-	if poolCount > int(serverCfg.Transport.MaxPoolCount) {
-		poolCount = int(serverCfg.Transport.MaxPoolCount)
+func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, error) {
+	if sessionCtx.LoginMsg.PoolCount < 0 {
+		return nil, fmt.Errorf("invalid pool count %d, must be non-negative", sessionCtx.LoginMsg.PoolCount)
 	}
+	if sessionCtx.ServerCfg.Transport.MaxPoolCount < 0 {
+		return nil, fmt.Errorf(
+			"invalid max pool count %d, must be non-negative",
+			sessionCtx.ServerCfg.Transport.MaxPoolCount,
+		)
+	}
+	effectivePoolCount := min(int64(sessionCtx.LoginMsg.PoolCount), sessionCtx.ServerCfg.Transport.MaxPoolCount)
+	maxPoolCountForChannel := int64(math.MaxInt) - int64(workConnPoolCapacityOffset)
+	if effectivePoolCount > maxPoolCountForChannel {
+		return nil, fmt.Errorf(
+			"invalid effective pool count %d, cannot safely add %d for work connection pool capacity",
+			effectivePoolCount, workConnPoolCapacityOffset,
+		)
+	}
+	poolCount := int(effectivePoolCount)
 	ctl := &Control{
-		rc:            rc,
-		pxyManager:    pxyManager,
-		pluginManager: pluginManager,
-		authVerifier:  authVerifier,
-		conn:          ctlConn,
-		loginMsg:      loginMsg,
-		workConnCh:    make(chan net.Conn, poolCount+10),
+		sessionCtx:    sessionCtx,
+		workConnCh:    make(chan *proxy.WorkConn, poolCount+workConnPoolCapacityOffset),
 		proxies:       make(map[string]proxy.Proxy),
 		poolCount:     poolCount,
 		portsUsedNum:  0,
-		runID:         loginMsg.RunID,
-		serverCfg:     serverCfg,
+		runID:         sessionCtx.LoginMsg.RunID,
+		state:         controlStateCreated,
 		xl:            xlog.FromContextSafe(ctx),
 		ctx:           ctx,
 		doneCh:        make(chan struct{}),
+		serverMetrics: metrics.Server,
 	}
 	ctl.lastPing.Store(time.Now())
 
-	if ctlConnEncrypted {
-		cryptoRW, err := netpkg.NewCryptoReadWriter(ctl.conn, []byte(ctl.serverCfg.Auth.Token))
-		if err != nil {
-			return nil, err
-		}
-		ctl.msgDispatcher = msg.NewDispatcher(cryptoRW)
-	} else {
-		ctl.msgDispatcher = msg.NewDispatcher(ctl.conn)
-	}
+	ctl.msgDispatcher = msg.NewDispatcher(sessionCtx.Conn)
 	ctl.registerMsgHandlers()
 	ctl.msgTransporter = transport.NewMessageTransporter(ctl.msgDispatcher)
 	return ctl, nil
 }
 
-// Start send a login success message to client and start working.
-func (ctl *Control) Start() {
-	loginRespMsg := &msg.LoginResp{
-		Version: version.Full(),
-		RunID:   ctl.runID,
-		Error:   "",
-	}
-	_ = msg.WriteMsg(ctl.conn, loginRespMsg)
-
-	go func() {
-		for i := 0; i < ctl.poolCount; i++ {
-			// ignore error here, that means that this control is closed
-			_ = ctl.msgDispatcher.Send(&msg.ReqWorkConn{})
-		}
-	}()
-	go ctl.worker()
+func (ctl *Control) RunID() string {
+	return ctl.runID
 }
 
-func (ctl *Control) Close() error {
-	ctl.conn.Close()
+func (ctl *Control) ID() ControlID {
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	return ctl.controlID
+}
+
+func (ctl *Control) admit(manager *ControlManager, id ControlID) error {
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	if ctl.state != controlStateCreated {
+		return fmt.Errorf("control [%s] is not in created state", ctl.runID)
+	}
+	ctl.manager = manager
+	ctl.controlID = id
+	ctl.state = controlStatePending
 	return nil
 }
 
-func (ctl *Control) Replaced(newCtl *Control) {
-	xl := ctl.xl
-	xl.Infof("replaced by client [%s]", newCtl.runID)
-	ctl.runID = ""
-	ctl.conn.Close()
+func (ctl *Control) setHandoffBarrier(barrier <-chan struct{}) {
+	ctl.lifecycleMu.Lock()
+	ctl.handoffBarrier = barrier
+	ctl.lifecycleMu.Unlock()
 }
 
-func (ctl *Control) RegisterWorkConn(conn net.Conn) error {
-	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Errorf("panic error: %v", err)
-			xl.Errorf(string(debug.Stack()))
-		}
-	}()
-
-	select {
-	case ctl.workConnCh <- conn:
-		xl.Debugf("new work connection registered")
-		return nil
-	default:
-		xl.Debugf("work connection pool is full, discarding")
-		return fmt.Errorf("work connection pool is full, discarding")
+func (ctl *Control) WaitForHandoff() {
+	ctl.lifecycleMu.Lock()
+	barrier := ctl.handoffBarrier
+	ctl.lifecycleMu.Unlock()
+	if barrier != nil {
+		<-barrier
 	}
+}
+
+// Start starts the control session workers after login succeeds.
+func (ctl *Control) Start() bool {
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+	return ctl.startLocked()
+}
+
+func (ctl *Control) startLocked() bool {
+	if ctl.state != controlStatePending || !ctl.activated {
+		return false
+	}
+	ctl.state = controlStateRunning
+	go ctl.worker()
+	return true
+}
+
+func (ctl *Control) Close() error {
+	ctl.lifecycleMu.Lock()
+	switch ctl.state {
+	case controlStateCreated, controlStatePending:
+		ctl.state = controlStateClosing
+		ctl.finishLocked()
+	case controlStateRunning:
+		ctl.state = controlStateClosing
+	}
+	ctl.lifecycleMu.Unlock()
+	return ctl.interruptReadAndClose()
+}
+
+func (ctl *Control) Replaced(newCtl *Control) {
+	ctl.markReplaced()
+	ctl.xl.Infof("replaced by client [%s] (control ID %d)", newCtl.runID, newCtl.ID())
+	_ = ctl.interruptReadAndClose()
+}
+
+// markReplaced returns the transitive predecessor barrier. A pending control
+// has no worker, so it finishes immediately and passes its inherited barrier
+// to the replacement. A running control is finished only by its worker.
+func (ctl *Control) markReplaced() <-chan struct{} {
+	ctl.lifecycleMu.Lock()
+	defer ctl.lifecycleMu.Unlock()
+
+	switch ctl.state {
+	case controlStateCreated:
+		ctl.state = controlStateClosing
+		ctl.finishLocked()
+		return nil
+	case controlStatePending:
+		barrier := ctl.handoffBarrier
+		ctl.state = controlStateClosing
+		ctl.finishLocked()
+		return barrier
+	case controlStateRunning:
+		ctl.state = controlStateClosing
+		return ctl.doneCh
+	case controlStateClosing, controlStateClosed:
+		return ctl.doneCh
+	default:
+		return ctl.doneCh
+	}
+}
+
+func (ctl *Control) interruptReadAndClose() error {
+	ctl.interruptOnce.Do(func() {
+		_ = ctl.sessionCtx.Conn.SetReadDeadline(time.Now())
+		ctl.interruptErr = ctl.sessionCtx.Conn.Close()
+	})
+	return ctl.interruptErr
+}
+
+func (ctl *Control) finishLocked() {
+	if ctl.state == controlStateClosed {
+		return
+	}
+	ctl.state = controlStateClosed
+	close(ctl.doneCh)
 }
 
 // When frps get one user connection, we get one work connection from the pool and return it.
 // If no workConn available in the pool, send message to frpc to get one or more
 // and wait until it is available.
 // return an error if wait timeout
-func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
+func (ctl *Control) GetWorkConn() (workConn *proxy.WorkConn, err error) {
 	xl := ctl.xl
 	defer func() {
 		if err := recover(); err != nil {
@@ -284,7 +624,7 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 				return
 			}
 
-		case <-time.After(time.Duration(ctl.serverCfg.UserConnTimeout) * time.Second):
+		case <-time.After(time.Duration(ctl.sessionCtx.ServerCfg.UserConnTimeout) * time.Second):
 			err = fmt.Errorf("timeout trying to get work connection")
 			xl.Warnf("%v", err)
 			return
@@ -297,15 +637,15 @@ func (ctl *Control) GetWorkConn() (workConn net.Conn, err error) {
 }
 
 func (ctl *Control) heartbeatWorker() {
-	if ctl.serverCfg.Transport.HeartbeatTimeout <= 0 {
+	if ctl.sessionCtx.ServerCfg.Transport.HeartbeatTimeout <= 0 {
 		return
 	}
 
 	xl := ctl.xl
-	go wait.Until(func() {
-		if time.Since(ctl.lastPing.Load().(time.Time)) > time.Duration(ctl.serverCfg.Transport.HeartbeatTimeout)*time.Second {
+	wait.Until(func() {
+		if time.Since(ctl.lastPing.Load().(time.Time)) > time.Duration(ctl.sessionCtx.ServerCfg.Transport.HeartbeatTimeout)*time.Second {
 			xl.Warnf("heartbeat timeout")
-			ctl.conn.Close()
+			_ = ctl.Close()
 			return
 		}
 	}, time.Second, ctl.doneCh)
@@ -316,46 +656,72 @@ func (ctl *Control) WaitClosed() {
 	<-ctl.doneCh
 }
 
+func (ctl *Control) loginUserInfo() plugin.UserInfo {
+	return plugin.UserInfo{
+		User:  ctl.sessionCtx.LoginMsg.User,
+		Metas: ctl.sessionCtx.LoginMsg.Metas,
+		RunID: ctl.runID,
+	}
+}
+
+func (ctl *Control) closeProxy(pxy proxy.Proxy) {
+	pxy.Close()
+	ctl.sessionCtx.PxyManager.Del(pxy.GetName())
+	ctl.serverMetrics.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
+
+	notifyContent := &plugin.CloseProxyContent{
+		User: ctl.loginUserInfo(),
+		CloseProxy: msg.CloseProxy{
+			ProxyName: pxy.GetName(),
+		},
+	}
+	go func() {
+		_ = ctl.sessionCtx.PluginManager.CloseProxy(notifyContent)
+	}()
+}
+
 func (ctl *Control) worker() {
 	xl := ctl.xl
+	ctl.serverMetrics.NewClient()
 
 	go ctl.heartbeatWorker()
 	go ctl.msgDispatcher.Run()
+	go func() {
+		for i := 0; i < ctl.poolCount; i++ {
+			// Ignore the error: it means this control is already closing.
+			_ = ctl.msgDispatcher.Send(&msg.ReqWorkConn{})
+		}
+	}()
 
 	<-ctl.msgDispatcher.Done()
-	ctl.conn.Close()
+	ctl.lifecycleMu.Lock()
+	if ctl.state == controlStateRunning {
+		ctl.state = controlStateClosing
+	}
+	ctl.lifecycleMu.Unlock()
+	_ = ctl.interruptReadAndClose()
 
 	ctl.mu.Lock()
-	defer ctl.mu.Unlock()
-
 	close(ctl.workConnCh)
 	for workConn := range ctl.workConnCh {
 		workConn.Close()
 	}
+	proxies := ctl.proxies
+	ctl.proxies = make(map[string]proxy.Proxy)
+	ctl.mu.Unlock()
 
-	for _, pxy := range ctl.proxies {
-		pxy.Close()
-		ctl.pxyManager.Del(pxy.GetName())
-		metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
-
-		notifyContent := &plugin.CloseProxyContent{
-			User: plugin.UserInfo{
-				User:  ctl.loginMsg.User,
-				Metas: ctl.loginMsg.Metas,
-				RunID: ctl.loginMsg.RunID,
-			},
-			CloseProxy: msg.CloseProxy{
-				ProxyName: pxy.GetName(),
-			},
-		}
-		go func() {
-			_ = ctl.pluginManager.CloseProxy(notifyContent)
-		}()
+	for _, pxy := range proxies {
+		ctl.closeProxy(pxy)
 	}
 
-	metrics.Server.CloseClient()
+	ctl.serverMetrics.CloseClient()
+	if ctl.manager != nil {
+		ctl.manager.Remove(ctl)
+	}
 	xl.Infof("client exit success")
-	close(ctl.doneCh)
+	ctl.lifecycleMu.Lock()
+	ctl.finishLocked()
+	ctl.lifecycleMu.Unlock()
 }
 
 func (ctl *Control) registerMsgHandlers() {
@@ -372,15 +738,11 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 	inMsg := m.(*msg.NewProxy)
 
 	content := &plugin.NewProxyContent{
-		User: plugin.UserInfo{
-			User:  ctl.loginMsg.User,
-			Metas: ctl.loginMsg.Metas,
-			RunID: ctl.loginMsg.RunID,
-		},
+		User:     ctl.loginUserInfo(),
 		NewProxy: *inMsg,
 	}
 	var remoteAddr string
-	retContent, err := ctl.pluginManager.NewProxy(content)
+	retContent, err := ctl.sessionCtx.PluginManager.NewProxy(content)
 	if err == nil {
 		inMsg = &retContent.NewProxy
 		remoteAddr, err = ctl.RegisterProxy(inMsg)
@@ -393,11 +755,15 @@ func (ctl *Control) handleNewProxy(m msg.Message) {
 	if err != nil {
 		xl.Warnf("new proxy [%s] type [%s] error: %v", inMsg.ProxyName, inMsg.ProxyType, err)
 		resp.Error = util.GenerateResponseErrorString(fmt.Sprintf("new proxy [%s] error", inMsg.ProxyName),
-			err, lo.FromPtr(ctl.serverCfg.DetailedErrorsToClient))
+			err, lo.FromPtr(ctl.sessionCtx.ServerCfg.DetailedErrorsToClient))
 	} else {
 		resp.RemoteAddr = remoteAddr
 		xl.Infof("new proxy [%s] type [%s] success", inMsg.ProxyName, inMsg.ProxyType)
-		metrics.Server.NewProxy(inMsg.ProxyName, inMsg.ProxyType)
+		clientID := ctl.sessionCtx.LoginMsg.ClientID
+		if clientID == "" {
+			clientID = ctl.runID
+		}
+		ctl.serverMetrics.NewProxy(inMsg.ProxyName, inMsg.ProxyType, ctl.sessionCtx.LoginMsg.User, clientID)
 	}
 	_ = ctl.msgDispatcher.Send(resp)
 }
@@ -407,22 +773,18 @@ func (ctl *Control) handlePing(m msg.Message) {
 	inMsg := m.(*msg.Ping)
 
 	content := &plugin.PingContent{
-		User: plugin.UserInfo{
-			User:  ctl.loginMsg.User,
-			Metas: ctl.loginMsg.Metas,
-			RunID: ctl.loginMsg.RunID,
-		},
+		User: ctl.loginUserInfo(),
 		Ping: *inMsg,
 	}
-	retContent, err := ctl.pluginManager.Ping(content)
+	retContent, err := ctl.sessionCtx.PluginManager.Ping(content)
 	if err == nil {
 		inMsg = &retContent.Ping
-		err = ctl.authVerifier.VerifyPing(inMsg)
+		err = ctl.sessionCtx.AuthVerifier.VerifyPing(inMsg)
 	}
 	if err != nil {
 		xl.Warnf("received invalid ping: %v", err)
 		_ = ctl.msgDispatcher.Send(&msg.Pong{
-			Error: util.GenerateResponseErrorString("invalid ping", err, lo.FromPtr(ctl.serverCfg.DetailedErrorsToClient)),
+			Error: util.GenerateResponseErrorString("invalid ping", err, lo.FromPtr(ctl.sessionCtx.ServerCfg.DetailedErrorsToClient)),
 		})
 		return
 	}
@@ -433,17 +795,17 @@ func (ctl *Control) handlePing(m msg.Message) {
 
 func (ctl *Control) handleNatHoleVisitor(m msg.Message) {
 	inMsg := m.(*msg.NatHoleVisitor)
-	ctl.rc.NatHoleController.HandleVisitor(inMsg, ctl.msgTransporter, ctl.loginMsg.User)
+	ctl.sessionCtx.RC.NatHoleController.HandleVisitor(inMsg, ctl.msgTransporter, ctl.sessionCtx.LoginMsg.User)
 }
 
 func (ctl *Control) handleNatHoleClient(m msg.Message) {
 	inMsg := m.(*msg.NatHoleClient)
-	ctl.rc.NatHoleController.HandleClient(inMsg, ctl.msgTransporter)
+	ctl.sessionCtx.RC.NatHoleController.HandleClient(inMsg, ctl.msgTransporter)
 }
 
 func (ctl *Control) handleNatHoleReport(m msg.Message) {
 	inMsg := m.(*msg.NatHoleReport)
-	ctl.rc.NatHoleController.HandleReport(inMsg)
+	ctl.sessionCtx.RC.NatHoleController.HandleReport(inMsg)
 }
 
 func (ctl *Control) handleCloseProxy(m msg.Message) {
@@ -456,15 +818,15 @@ func (ctl *Control) handleCloseProxy(m msg.Message) {
 func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
 	var pxyConf v1.ProxyConfigurer
 	// Load configures from NewProxy message and validate.
-	pxyConf, err = config.NewProxyConfigurerFromMsg(pxyMsg, ctl.serverCfg)
+	pxyConf, err = config.NewProxyConfigurerFromMsg(pxyMsg, ctl.sessionCtx.ServerCfg)
 	if err != nil {
 		return
 	}
 
 	// User info
 	userInfo := plugin.UserInfo{
-		User:  ctl.loginMsg.User,
-		Metas: ctl.loginMsg.Metas,
+		User:  ctl.sessionCtx.LoginMsg.User,
+		Metas: ctl.sessionCtx.LoginMsg.Metas,
 		RunID: ctl.runID,
 	}
 
@@ -472,21 +834,24 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 	// In fact, it creates different proxies based on the proxy type. We just call run() here.
 	pxy, err := proxy.NewProxy(ctl.ctx, &proxy.Options{
 		UserInfo:           userInfo,
-		LoginMsg:           ctl.loginMsg,
+		LoginMsg:           ctl.sessionCtx.LoginMsg,
 		PoolCount:          ctl.poolCount,
-		ResourceController: ctl.rc,
+		ResourceController: ctl.sessionCtx.RC,
 		GetWorkConnFn:      ctl.GetWorkConn,
 		Configurer:         pxyConf,
-		ServerCfg:          ctl.serverCfg,
+		ServerCfg:          ctl.sessionCtx.ServerCfg,
+		EncryptionKey:      ctl.sessionCtx.EncryptionKey,
+		WireProtocol:       ctl.sessionCtx.WireProtocol,
+		UDPPacketCodec:     ctl.sessionCtx.UDPPacketCodec,
 	})
 	if err != nil {
 		return remoteAddr, err
 	}
 
 	// Check ports used number in each client
-	if ctl.serverCfg.MaxPortsPerClient > 0 {
+	if ctl.sessionCtx.ServerCfg.MaxPortsPerClient > 0 {
 		ctl.mu.Lock()
-		if ctl.portsUsedNum+pxy.GetUsedPortsNum() > int(ctl.serverCfg.MaxPortsPerClient) {
+		if ctl.portsUsedNum+pxy.GetUsedPortsNum() > int(ctl.sessionCtx.ServerCfg.MaxPortsPerClient) {
 			ctl.mu.Unlock()
 			err = fmt.Errorf("exceed the max_ports_per_client")
 			return
@@ -503,7 +868,7 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 		}()
 	}
 
-	if ctl.pxyManager.Exist(pxyMsg.ProxyName) {
+	if ctl.sessionCtx.PxyManager.Exist(pxyMsg.ProxyName) {
 		err = fmt.Errorf("proxy [%s] already exists", pxyMsg.ProxyName)
 		return
 	}
@@ -518,7 +883,7 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 		}
 	}()
 
-	err = ctl.pxyManager.Add(pxyMsg.ProxyName, pxy)
+	err = ctl.sessionCtx.PxyManager.Add(pxyMsg.ProxyName, pxy)
 	if err != nil {
 		return
 	}
@@ -537,28 +902,12 @@ func (ctl *Control) CloseProxy(closeMsg *msg.CloseProxy) (err error) {
 		return
 	}
 
-	if ctl.serverCfg.MaxPortsPerClient > 0 {
+	if ctl.sessionCtx.ServerCfg.MaxPortsPerClient > 0 {
 		ctl.portsUsedNum -= pxy.GetUsedPortsNum()
 	}
-	pxy.Close()
-	ctl.pxyManager.Del(pxy.GetName())
 	delete(ctl.proxies, closeMsg.ProxyName)
 	ctl.mu.Unlock()
 
-	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
-
-	notifyContent := &plugin.CloseProxyContent{
-		User: plugin.UserInfo{
-			User:  ctl.loginMsg.User,
-			Metas: ctl.loginMsg.Metas,
-			RunID: ctl.loginMsg.RunID,
-		},
-		CloseProxy: msg.CloseProxy{
-			ProxyName: pxy.GetName(),
-		},
-	}
-	go func() {
-		_ = ctl.pluginManager.CloseProxy(notifyContent)
-	}()
+	ctl.closeProxy(pxy)
 	return
 }

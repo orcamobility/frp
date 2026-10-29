@@ -15,9 +15,91 @@
 package msg
 
 import (
+	"context"
 	"io"
+	"net"
 	"reflect"
+	"sync"
+	"time"
+
+	"github.com/fatedier/frp/pkg/proto/wire"
 )
+
+type ReadWriter interface {
+	ReadMsg() (Message, error)
+	ReadMsgInto(Message) error
+	WriteMsg(Message) error
+}
+
+type Conn struct {
+	net.Conn
+	rw ReadWriter
+}
+
+func NewConn(conn net.Conn, rw ReadWriter) *Conn {
+	return &Conn{
+		Conn: conn,
+		rw:   rw,
+	}
+}
+
+func (c *Conn) ReadMsg() (Message, error) {
+	return c.rw.ReadMsg()
+}
+
+func (c *Conn) ReadMsgInto(m Message) error {
+	return c.rw.ReadMsgInto(m)
+}
+
+func (c *Conn) WriteMsg(m Message) error {
+	return c.rw.WriteMsg(m)
+}
+
+func (c *Conn) Context() context.Context {
+	if getter, ok := c.Conn.(interface{ Context() context.Context }); ok {
+		return getter.Context()
+	}
+	return context.Background()
+}
+
+func (c *Conn) WithContext(ctx context.Context) {
+	if setter, ok := c.Conn.(interface{ WithContext(context.Context) }); ok {
+		setter.WithContext(ctx)
+	}
+}
+
+type V1ReadWriter struct {
+	rw io.ReadWriter
+}
+
+func NewV1ReadWriter(rw io.ReadWriter) ReadWriter {
+	return &V1ReadWriter{rw: rw}
+}
+
+// NewReadWriter wraps rw with the message codec for the selected wire protocol.
+// An empty protocol keeps the historical v1 behavior for tests and older call sites.
+func NewReadWriter(rw io.ReadWriter, wireProtocol string) ReadWriter {
+	switch wireProtocol {
+	case wire.ProtocolV2:
+		return NewV2ReadWriter(rw)
+	case "", wire.ProtocolV1:
+		return NewV1ReadWriter(rw)
+	default:
+		return NewV1ReadWriter(rw)
+	}
+}
+
+func (rw *V1ReadWriter) ReadMsg() (Message, error) {
+	return ReadMsg(rw.rw)
+}
+
+func (rw *V1ReadWriter) ReadMsgInto(m Message) error {
+	return ReadMsgInto(rw.rw, m)
+}
+
+func (rw *V1ReadWriter) WriteMsg(m Message) error {
+	return WriteMsg(rw.rw, m)
+}
 
 func AsyncHandler(f func(Message)) func(Message) {
 	return func(m Message) {
@@ -27,19 +109,26 @@ func AsyncHandler(f func(Message)) func(Message) {
 
 // Dispatcher is used to send messages to net.Conn or register handlers for messages read from net.Conn.
 type Dispatcher struct {
-	rw io.ReadWriter
+	rw ReadWriter
 
-	sendCh         chan Message
-	doneCh         chan struct{}
-	msgHandlers    map[reflect.Type]func(Message)
-	defaultHandler func(Message)
+	sendCh      chan Message
+	doneCh      chan struct{}
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+	msgHandlers map[reflect.Type]func(Message)
 }
 
-func NewDispatcher(rw io.ReadWriter) *Dispatcher {
+// NewDispatcher uses SetReadDeadline, when supported, and Close, when rw
+// implements io.Closer, to interrupt ReadMsg after a write failure. Without a
+// working read deadline, Close or the caller must arrange for ReadMsg to return.
+// These methods must return in bounded time and must not wait for Done: Done
+// closes only after ReadMsg, any synchronous handler, and stop have returned.
+func NewDispatcher(rw ReadWriter) *Dispatcher {
 	return &Dispatcher{
 		rw:          rw,
 		sendCh:      make(chan Message, 100),
 		doneCh:      make(chan struct{}),
+		stopCh:      make(chan struct{}),
 		msgHandlers: make(map[reflect.Type]func(Message)),
 	}
 }
@@ -50,48 +139,83 @@ func (d *Dispatcher) Run() {
 	go d.readLoop()
 }
 
+// stop rejects new sends and interrupts ReadMsg when supported by rw. Done remains
+// owned by readLoop so the control owner cannot clean up while a handler is running.
+func (d *Dispatcher) stop() {
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+		if conn, ok := d.rw.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = conn.SetReadDeadline(time.Now())
+		}
+		if closer, ok := d.rw.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	})
+}
+
 func (d *Dispatcher) sendLoop() {
 	for {
 		select {
-		case <-d.doneCh:
+		case <-d.stopCh:
 			return
 		case m := <-d.sendCh:
-			_ = WriteMsg(d.rw, m)
+			if err := d.rw.WriteMsg(m); err != nil {
+				d.stop()
+				return
+			}
 		}
 	}
 }
 
 func (d *Dispatcher) readLoop() {
+	defer close(d.doneCh)
+	defer d.stop()
 	for {
-		m, err := ReadMsg(d.rw)
+		m, err := d.rw.ReadMsg()
 		if err != nil {
-			close(d.doneCh)
 			return
+		}
+
+		select {
+		case <-d.stopCh:
+			return
+		default:
 		}
 
 		if handler, ok := d.msgHandlers[reflect.TypeOf(m)]; ok {
 			handler(m)
-		} else if d.defaultHandler != nil {
-			d.defaultHandler(m)
 		}
 	}
 }
 
+// Send queues m for writing. A nil error does not guarantee delivery.
 func (d *Dispatcher) Send(m Message) error {
 	select {
-	case <-d.doneCh:
+	case <-d.stopCh:
+		return io.EOF
+	default:
+	}
+	return d.enqueue(m)
+}
+
+func (d *Dispatcher) enqueue(m Message) error {
+	select {
+	case <-d.stopCh:
 		return io.EOF
 	case d.sendCh <- m:
-		return nil
+		// Both cases can be ready if shutdown races with enqueueing. Do not
+		// report success when shutdown is already observable after the send.
+		select {
+		case <-d.stopCh:
+			return io.EOF
+		default:
+			return nil
+		}
 	}
 }
 
 func (d *Dispatcher) RegisterHandler(msg Message, handler func(Message)) {
 	d.msgHandlers[reflect.TypeOf(msg)] = handler
-}
-
-func (d *Dispatcher) RegisterDefaultHandler(handler func(Message)) {
-	d.defaultHandler = handler
 }
 
 func (d *Dispatcher) Done() chan struct{} {

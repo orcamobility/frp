@@ -15,9 +15,6 @@
 package v1
 
 import (
-	"context"
-	"fmt"
-
 	"github.com/samber/lo"
 
 	"github.com/fatedier/frp/pkg/config/types"
@@ -121,7 +118,7 @@ func (c *ServerConfig) Complete() error {
 	}
 
 	c.VhostHTTPTimeout = util.EmptyOr(c.VhostHTTPTimeout, 60)
-	c.DetailedErrorsToClient = util.EmptyOr(c.DetailedErrorsToClient, lo.ToPtr(true))
+	c.DetailedErrorsToClient = util.EmptyOr(c.DetailedErrorsToClient, new(true))
 	c.UserConnTimeout = util.EmptyOr(c.UserConnTimeout, 10)
 	c.UDPPacketSize = util.EmptyOr(c.UDPPacketSize, 1500)
 	c.NatHoleAnalysisDataReserveHours = util.EmptyOr(c.NatHoleAnalysisDataReserveHours, 7*24)
@@ -138,17 +135,6 @@ type AuthServerConfig struct {
 
 func (c *AuthServerConfig) Complete() error {
 	c.Method = util.EmptyOr(c.Method, "token")
-
-	// Resolve tokenSource during configuration loading
-	if c.Method == AuthMethodToken && c.TokenSource != nil {
-		token, err := c.TokenSource.Resolve(context.Background())
-		if err != nil {
-			return fmt.Errorf("failed to resolve auth.tokenSource: %w", err)
-		}
-		// Move the resolved token to the Token field and clear TokenSource
-		c.Token = token
-		c.TokenSource = nil
-	}
 	return nil
 }
 
@@ -181,7 +167,7 @@ type ServerTransportConfig struct {
 	// If negative, keep-alive probes are disabled.
 	TCPKeepAlive int64 `json:"tcpKeepalive,omitempty"`
 	// MaxPoolCount specifies the maximum pool size for each proxy. By default,
-	// this value is 5.
+	// this value is 5. Negative values are invalid.
 	MaxPoolCount int64 `json:"maxPoolCount,omitempty"`
 	// HeartBeatTimeout specifies the maximum time to wait for a heartbeat
 	// before terminating the connection. It is not recommended to change this
@@ -194,7 +180,7 @@ type ServerTransportConfig struct {
 }
 
 func (c *ServerTransportConfig) Complete() {
-	c.TCPMux = util.EmptyOr(c.TCPMux, lo.ToPtr(true))
+	c.TCPMux = util.EmptyOr(c.TCPMux, new(true))
 	c.TCPMuxKeepaliveInterval = util.EmptyOr(c.TCPMuxKeepaliveInterval, 30)
 	c.TCPKeepAlive = util.EmptyOr(c.TCPKeepAlive, 7200)
 	c.MaxPoolCount = util.EmptyOr(c.MaxPoolCount, 5)
