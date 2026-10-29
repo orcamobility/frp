@@ -131,6 +131,9 @@ func (c *Controller) handlePacket(buf []byte) {
 }
 
 func (c *Controller) Stop() error {
+	if c.tun == nil {
+		return nil
+	}
 	return c.tun.Close()
 }
 
@@ -243,9 +246,9 @@ func (c *Controller) RegisterClientRoute(ctx context.Context, name string, route
 	go c.readLoopClient(ctx, conn)
 }
 
-// UnregisterClientRoute Remove client route from routing table
-func (c *Controller) UnregisterClientRoute(name string) {
-	c.clientRouter.delRoute(name)
+// UnregisterClientRoute removes a client route only when it is still owned by conn.
+func (c *Controller) UnregisterClientRoute(name string, conn io.Writer) bool {
+	return c.clientRouter.delRoute(name, conn)
 }
 
 // StartServerConnReadLoop starts the read loop for a server connection
@@ -283,7 +286,6 @@ func (r *clientRouter) addRoute(name string, routes []net.IPNet, conn io.ReadWri
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.routes[name] = &routeElement{
-		name:   name,
 		routes: routes,
 		conn:   conn,
 	}
@@ -302,10 +304,15 @@ func (r *clientRouter) findConn(dst net.IP) (io.Writer, error) {
 	return nil, fmt.Errorf("no route found for destination %s", dst)
 }
 
-func (r *clientRouter) delRoute(name string) {
+func (r *clientRouter) delRoute(name string, conn io.Writer) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	re, ok := r.routes[name]
+	if !ok || re.conn != conn {
+		return false
+	}
 	delete(r.routes, name)
+	return true
 }
 
 func (r *clientRouter) removeConnRoute(conn io.Writer) {
@@ -380,7 +387,6 @@ func (r *serverRouter) cleanupConnIPs(conn io.Writer) {
 }
 
 type routeElement struct {
-	name   string
 	routes []net.IPNet
 	conn   io.ReadWriteCloser
 }

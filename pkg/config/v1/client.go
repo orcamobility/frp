@@ -15,8 +15,6 @@
 package v1
 
 import (
-	"context"
-	"fmt"
 	"os"
 
 	"github.com/samber/lo"
@@ -39,6 +37,8 @@ type ClientCommonConfig struct {
 	// clients. If this value is not "", proxy names will automatically be
 	// changed to "{user}.{proxy_name}".
 	User string `json:"user,omitempty"`
+	// ClientID uniquely identifies this frpc instance.
+	ClientID string `json:"clientID,omitempty"`
 
 	// ServerAddr specifies the address of the server to connect to. By
 	// default, this value is "0.0.0.0".
@@ -77,12 +77,15 @@ type ClientCommonConfig struct {
 
 	// Include other config files for proxies.
 	IncludeConfigFiles []string `json:"includes,omitempty"`
+
+	// Store config enables the built-in store source (not configurable via sources list).
+	Store StoreConfig `json:"store,omitempty"`
 }
 
 func (c *ClientCommonConfig) Complete() error {
 	c.ServerAddr = util.EmptyOr(c.ServerAddr, "0.0.0.0")
 	c.ServerPort = util.EmptyOr(c.ServerPort, 7000)
-	c.LoginFailExit = util.EmptyOr(c.LoginFailExit, lo.ToPtr(true))
+	c.LoginFailExit = util.EmptyOr(c.LoginFailExit, new(true))
 	c.NatHoleSTUNServer = util.EmptyOr(c.NatHoleSTUNServer, "stun.easyvoip.com:3478")
 
 	if err := c.Auth.Complete(); err != nil {
@@ -101,6 +104,9 @@ type ClientTransportConfig struct {
 	// Valid values are "tcp", "kcp", "quic", "websocket" and "wss". By default, this value
 	// is "tcp".
 	Protocol string `json:"protocol,omitempty"`
+	// WireProtocol specifies the frpc/frps internal wire protocol version.
+	// Valid values are "v1" and "v2". By default, this value is "v1".
+	WireProtocol string `json:"wireProtocol,omitempty"`
 	// The maximum amount of time a dial to server will wait for a connect to complete.
 	DialServerTimeout int64 `json:"dialServerTimeout,omitempty"`
 	// DialServerKeepAlive specifies the interval between keep-alive probes for an active network connection between frpc and frps.
@@ -140,11 +146,12 @@ type ClientTransportConfig struct {
 
 func (c *ClientTransportConfig) Complete() {
 	c.Protocol = util.EmptyOr(c.Protocol, "tcp")
+	c.WireProtocol = util.EmptyOr(c.WireProtocol, "v1")
 	c.DialServerTimeout = util.EmptyOr(c.DialServerTimeout, 10)
 	c.DialServerKeepAlive = util.EmptyOr(c.DialServerKeepAlive, 7200)
 	c.ProxyURL = util.EmptyOr(c.ProxyURL, os.Getenv("http_proxy"))
 	c.PoolCount = util.EmptyOr(c.PoolCount, 1)
-	c.TCPMux = util.EmptyOr(c.TCPMux, lo.ToPtr(true))
+	c.TCPMux = util.EmptyOr(c.TCPMux, new(true))
 	c.TCPMuxKeepaliveInterval = util.EmptyOr(c.TCPMuxKeepaliveInterval, 30)
 	if lo.FromPtr(c.TCPMux) {
 		// If TCPMux is enabled, heartbeat of application layer is unnecessary because we can rely on heartbeat in tcpmux.
@@ -173,8 +180,8 @@ type TLSClientConfig struct {
 }
 
 func (c *TLSClientConfig) Complete() {
-	c.Enable = util.EmptyOr(c.Enable, lo.ToPtr(true))
-	c.DisableCustomTLSFirstByte = util.EmptyOr(c.DisableCustomTLSFirstByte, lo.ToPtr(true))
+	c.Enable = util.EmptyOr(c.Enable, new(true))
+	c.DisableCustomTLSFirstByte = util.EmptyOr(c.DisableCustomTLSFirstByte, new(true))
 }
 
 type AuthClientConfig struct {
@@ -198,17 +205,6 @@ type AuthClientConfig struct {
 
 func (c *AuthClientConfig) Complete() error {
 	c.Method = util.EmptyOr(c.Method, "token")
-
-	// Resolve tokenSource during configuration loading
-	if c.Method == AuthMethodToken && c.TokenSource != nil {
-		token, err := c.TokenSource.Resolve(context.Background())
-		if err != nil {
-			return fmt.Errorf("failed to resolve auth.tokenSource: %w", err)
-		}
-		// Move the resolved token to the Token field and clear TokenSource
-		c.Token = token
-		c.TokenSource = nil
-	}
 	return nil
 }
 
@@ -247,24 +243,4 @@ type AuthOIDCClientConfig struct {
 
 type VirtualNetConfig struct {
 	Address string `json:"address,omitempty"`
-}
-
-const (
-	UnsafeFeatureTokenSourceExec = "TokenSourceExec"
-)
-
-type UnsafeFeatures struct {
-	features map[string]bool
-}
-
-func NewUnsafeFeatures(allowed []string) UnsafeFeatures {
-	features := make(map[string]bool)
-	for _, f := range allowed {
-		features[f] = true
-	}
-	return UnsafeFeatures{features: features}
-}
-
-func (u UnsafeFeatures) IsEnabled(feature string) bool {
-	return u.features[feature]
 }

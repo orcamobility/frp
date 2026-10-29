@@ -25,6 +25,7 @@ import (
 	"github.com/samber/lo"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/xlog"
 	"github.com/fatedier/frp/pkg/vnet"
@@ -49,10 +50,15 @@ func NewManager(
 	ctx context.Context,
 	runID string,
 	clientCfg *v1.ClientCommonConfig,
-	connectServer func() (net.Conn, error),
+	connectServer func() (*msg.Conn, error),
 	msgTransporter transport.MessageTransporter,
 	vnetController *vnet.Controller,
+	udpPacketCodecs ...string,
 ) *Manager {
+	udpPacketCodec := ""
+	if len(udpPacketCodecs) > 0 {
+		udpPacketCodec = udpPacketCodecs[0]
+	}
 	m := &Manager{
 		clientCfg:     clientCfg,
 		cfgs:          make(map[string]v1.VisitorConfigurer),
@@ -67,6 +73,7 @@ func NewManager(
 		vnetController:  vnetController,
 		transferConnFn:  m.TransferConn,
 		runID:           runID,
+		udpPacketCodec:  udpPacketCodec,
 	}
 	return m
 }
@@ -191,15 +198,23 @@ func (vm *Manager) TransferConn(name string, conn net.Conn) error {
 	return v.AcceptConn(conn)
 }
 
+func (vm *Manager) GetVisitorCfg(name string) (v1.VisitorConfigurer, bool) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	cfg, ok := vm.cfgs[name]
+	return cfg, ok
+}
+
 type visitorHelperImpl struct {
-	connectServerFn func() (net.Conn, error)
+	connectServerFn func() (*msg.Conn, error)
 	msgTransporter  transport.MessageTransporter
 	vnetController  *vnet.Controller
 	transferConnFn  func(name string, conn net.Conn) error
 	runID           string
+	udpPacketCodec  string
 }
 
-func (v *visitorHelperImpl) ConnectServer() (net.Conn, error) {
+func (v *visitorHelperImpl) ConnectServer() (*msg.Conn, error) {
 	return v.connectServerFn()
 }
 
@@ -217,4 +232,8 @@ func (v *visitorHelperImpl) VNetController() *vnet.Controller {
 
 func (v *visitorHelperImpl) RunID() string {
 	return v.runID
+}
+
+func (v *visitorHelperImpl) UDPPacketCodec() string {
+	return v.udpPacketCodec
 }

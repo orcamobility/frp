@@ -63,11 +63,12 @@ func (l *Logger) AddPrefix(prefix LogPrefix) *Logger {
 	if prefix.Priority <= 0 {
 		prefix.Priority = 10
 	}
-	for _, p := range l.prefixes {
+	for i, p := range l.prefixes {
 		if p.Name == prefix.Name {
 			found = true
-			p.Value = prefix.Value
-			p.Priority = prefix.Priority
+			l.prefixes[i].Value = prefix.Value
+			l.prefixes[i].Priority = prefix.Priority
+			break
 		}
 	}
 	if !found {
@@ -95,21 +96,21 @@ func (l *Logger) Spawn() *Logger {
 }
 
 func (l *Logger) Errorf(format string, v ...any) {
-	log.Logger.Errorf(l.prefixString+format, v...)
+	log.Logger.WithPrefix(l.prefixString).Errorf(format, v...)
 }
 
 func (l *Logger) Warnf(format string, v ...any) {
-	log.Logger.Warnf(l.prefixString+format, v...)
+	log.Logger.WithPrefix(l.prefixString).Warnf(format, v...)
 }
 
 func (l *Logger) Infof(format string, v ...any) {
-	log.Logger.Infof(l.prefixString+format, v...)
+	log.Logger.WithPrefix(l.prefixString).Infof(format, v...)
 }
 
 func (l *Logger) Debugf(format string, v ...any) {
-	log.Logger.Debugf(l.prefixString+format, v...)
+	log.Logger.WithPrefix(l.prefixString).Debugf(format, v...)
 }
 
 func (l *Logger) Tracef(format string, v ...any) {
-	log.Logger.Tracef(l.prefixString+format, v...)
+	log.Logger.WithPrefix(l.prefixString).Tracef(format, v...)
 }
